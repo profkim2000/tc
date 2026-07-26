@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>교사용 (Host & Relay - N:N Chat)</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; background: #f4f7f6; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 15px; }
+    input, button { padding: 10px; margin: 5px 0; font-size: 14px; }
+    button { background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    button:disabled { background: #ccc; }
+    #chatWindow { background: #ffffff; border: 1px solid #ddd; padding: 10px; height: 250px; overflow-y: auto; border-radius: 4px; margin-bottom: 10px; }
+    .msg { margin: 5px 0; padding: 6px 10px; border-radius: 6px; display: inline-block; max-width: 80%; }
+    .msg-system { background: #e9ecef; color: #6c757d; font-size: 12px; display: block; text-align: center; }
+    .msg-me { background: #007bff; color: white; float: right; clear: both; }
+    .msg-other { background: #e2e3e5; color: #333; float: left; clear: both; }
+    .badge { background: #17a2b8; color: white; padding: 3px 8px; border-radius: 12px; font-size: 12px; }
+  </style>
+</head>
+<body>
+
+  <h2>👨‍🏫 교사용 채팅 방 (다대다 중계 호스트)</h2>
+
+  <div class="card">
+    <h3>1. 방 생성</h3>
+    <input type="text" id="nameInput" placeholder="선생님 이름/닉네임" value="선생님">
+    <input type="text" id="pinInput" placeholder="비밀번호 설정 (예: 1234)">
+    <button id="btnCreate">방 생성하기</button>
+    <p>방 ID: <strong id="roomIdText" style="color: #007bff;">-</strong> | 접속 인원: <span id="peerCount" class="badge">0명</span></p>
+  </div>
+
+  <div class="card">
+    <h3>2. 전체 실시간 채팅</h3>
+    <div id="chatWindow"></div>
+    <input type="text" id="chatInput" placeholder="메시지 입력..." style="width: 70%;" disabled>
+    <button id="btnSend" disabled>전송</button>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getDatabase, ref, set, onChildAdded, push, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+    import { firebaseConfig, rtcConfig } from "./config.js";
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getDatabase(app);
+
+    const peers = {}; // { guestId: { pc, dataChannel } }
+    let roomId;
+    let pin;
+    let myName = "선생님";
+
+    function appendMessage(sender, text, isMe = false, isSystem = false) {
+      const win = document.getElementById('chatWindow');
+      const div = document.createElement('div');
+      
+      if (isSystem) {
+        div.className = 'msg msg-system';
+        div.innerText = text;
+      } else {
+        div.className = `msg ${isMe ? 'msg-me' : 'msg-other'}`;
+        div.innerText = isMe ? text : `[${sender}] ${text}`;
+      }
+      
+      win.appendChild(div);
+      win.scrollTop = win.scrollHeight;
+    }
+
+    function updatePeerCount() {
+      const activePeers = Object.values(peers).filter(p => p.dataChannel && p.dataChannel.readyState === 'open').length;
+      document.getElementById('peerCount').innerText = `${activePeers}명`;
+      document.getElementById('chatInput').disabled = activePeers === 0;
+      document.getElementById('btnSend').disabled = activePeers === 0;
+    }
+
+    // 다른 모든 학생들에게 메시지 중계(Broadcasting / Relay)
+    function relayMessage(packet, senderGuestId = null) {
+      const jsonStr = JSON.stringify(packet);
+      Object.entries(peers).forEach(([id, { dataChannel }]) => {
+        // 보낸 본인을 제외하고 나머지 모두에게 전송
+        if (id !== senderGuestId && dataChannel && dataChannel.readyState === 'open') {
+          dataChannel.send(jsonStr);
+        }
+      });
+    }
+
+    signInAnonymously(auth);
+
+    document.getElementById('btnCreate').addEventListener('click', async () => {
+      pin = document.getElementById('pinInput').value.trim();
+      myName = document.getElementById('nameInput').value.trim() || "선생님";
+      if (!pin) return alert("비밀번호를 입력하세요.");
+
+      roomId = crypto.randomUUID().slice(0, 8);
+      document.getElementById('roomIdText').innerText = roomId;
+      document.getElementById('btnCreate').disabled = true;
+      document.getElementById('nameInput').disabled = true;
+
+      await set(ref(db, `rooms/${roomId}`), { pin: pin });
+      appendMessage(null, `방이 생성되었습니다. (ID: ${roomId})`, false, true);
+
+      // 학생 입장 감지
+      onChildAdded(ref(db, `rooms/${roomId}/guests`), (snapshot) => {
+        const guestId = snapshot.key;
+        initHostPeerForGuest(guestId);
+      });
+    });
+
+    // initHostPeerForGuest 함수 내부의 SDP / Candidate 수신 로직 보완
+async function initHostPeerForGuest(guestId) {
+  const pc = new RTCPeerConnection(rtcConfig);
+  const dataChannel = pc.createDataChannel("chatChannel");
+
+  peers[guestId] = { pc, dataChannel };
+
+  // ICE 연결 상태 모니터링 로그
+  pc.oniceconnectionstatechange = () => {
+    appendMessage(null, `[${guestId.slice(0, 4)}] ICE 상태: ${pc.iceConnectionState}`, false, true);
+  };
+
+  dataChannel.onopen = () => {
+    updatePeerCount();
+    appendMessage(null, `🎉 [학생 ${guestId.slice(0, 4)}] 연결 성공!`, false, true);
+  };
+
+  dataChannel.onclose = () => {
+    delete peers[guestId];
+    updatePeerCount();
+    appendMessage(null, `학생 [${guestId.slice(0, 4)}] 퇴장`, false, true);
+  };
+
+  dataChannel.onmessage = (e) => {
+    try {
+      const packet = JSON.parse(e.data);
+      appendMessage(packet.sender, packet.text, false);
+      relayMessage(packet, guestId);
+    } catch (err) {
+      console.error("수신 데이터 파싱 오류:", err);
+    }
+  };
+
+  // Host의 Candidate 저장
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      push(ref(db, `rooms/${roomId}/guests/${guestId}/hostCandidates`), event.candidate.toJSON());
+    }
+  };
+
+  // 1. Offer 생성 및 전송
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  await set(ref(db, `rooms/${roomId}/guests/${guestId}/offer`), {
+    sdp: offer.sdp,
+    type: offer.type
+  });
+
+  // 2. 학생의 Answer 감지 (onValue 대신 onChildAdded 또는 snapshot 확인)
+  onValue(ref(db, `rooms/${roomId}/guests/${guestId}/answer`), async (snapshot) => {
+    const answerData = snapshot.val();
+    if (answerData && answerData.sdp && pc.signalingState === "have-local-offer") {
+      await pc.setRemoteDescription(new RTCSessionDescription(answerData));
+      appendMessage(null, `[${guestId.slice(0, 4)}] Answer 수신 완료`, false, true);
+    }
+  });
+
+  // 3. 학생의 Candidates 감지
+  onChildAdded(ref(db, `rooms/${roomId}/guests/${guestId}/guestCandidates`), (snapshot) => {
+    const cand = snapshot.val();
+    if (cand) {
+      pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.error("Candidate 추가 에러:", e));
+    }
+  });
+}
+
+    // 선생님이 메시지 전송 버튼 클릭 시
+    function sendMessage() {
+      const text = document.getElementById('chatInput').value.trim();
+      if (!text) return;
+
+      const packet = { sender: myName, text: text };
+
+      // 1. 내 화면에 표시
+      appendMessage(myName, text, true);
+
+      // 2. 접속한 모든 학생에게 전송
+      relayMessage(packet);
+
+      document.getElementById('chatInput').value = '';
+    }
+
+    document.getElementById('btnSend').addEventListener('click', sendMessage);
+    document.getElementById('chatInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
+  </script>
+</body>
+</html>

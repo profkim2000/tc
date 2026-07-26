@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>학생용 (Guest - N:N Chat)</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; background: #fdf7f2; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 15px; }
+    input, button { padding: 10px; margin: 5px 0; font-size: 14px; }
+    button { background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    button:disabled { background: #ccc; }
+    #chatWindow { background: #ffffff; border: 1px solid #ddd; padding: 10px; height: 250px; overflow-y: auto; border-radius: 4px; margin-bottom: 10px; }
+    .msg { margin: 5px 0; padding: 6px 10px; border-radius: 6px; display: inline-block; max-width: 80%; }
+    .msg-system { background: #e9ecef; color: #6c757d; font-size: 12px; display: block; text-align: center; }
+    .msg-me { background: #28a745; color: white; float: right; clear: both; }
+    .msg-other { background: #e2e3e5; color: #333; float: left; clear: both; }
+  </style>
+</head>
+<body>
+
+  <h2>👨‍🎓 학생용 채팅 클라이언트</h2>
+
+  <div class="card">
+    <h3>1. 수업 방 접속</h3>
+    <input type="text" id="nameInput" placeholder="내 이름/닉네임 입력">
+    <input type="text" id="roomIdInput" placeholder="방 ID 입력">
+    <input type="password" id="pinInput" placeholder="비밀번호 입력">
+    <button id="btnJoin">입장하기</button>
+  </div>
+
+  <div class="card">
+    <h3>2. 실시간 채팅</h3>
+    <div id="chatWindow"></div>
+    <input type="text" id="chatInput" placeholder="메시지 입력..." style="width: 70%;" disabled>
+    <button id="btnSend" disabled>전송</button>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getDatabase, ref, set, push, onValue, onChildAdded } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+    import { firebaseConfig, rtcConfig } from "./config.js";
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getDatabase(app);
+
+    let pc;
+    let dataChannel;
+    let myName = "학생";
+    const guestId = crypto.randomUUID().slice(0, 8);
+
+    function appendMessage(sender, text, isMe = false, isSystem = false) {
+      const win = document.getElementById('chatWindow');
+      const div = document.createElement('div');
+      
+      if (isSystem) {
+        div.className = 'msg msg-system';
+        div.innerText = text;
+      } else {
+        div.className = `msg ${isMe ? 'msg-me' : 'msg-other'}`;
+        div.innerText = isMe ? text : `[${sender}] ${text}`;
+      }
+      
+      win.appendChild(div);
+      win.scrollTop = win.scrollHeight;
+    }
+
+    signInAnonymously(auth);
+
+    // btnJoin 클릭 이벤트 내부 보완
+document.getElementById('btnJoin').addEventListener('click', async () => {
+  const roomId = document.getElementById('roomIdInput').value.trim();
+  const pin = document.getElementById('pinInput').value.trim();
+  myName = document.getElementById('nameInput').value.trim() || `학생_${guestId.slice(0,4)}`;
+
+  if (!roomId || !pin) return alert("방 ID와 비밀번호를 모두 입력하세요.");
+
+  appendMessage(null, "방 접속 요청 중...", false, true);
+
+  pc = new RTCPeerConnection(rtcConfig);
+
+  pc.oniceconnectionstatechange = () => {
+    appendMessage(null, `ICE 연결 상태: ${pc.iceConnectionState}`, false, true);
+  };
+
+  pc.ondatachannel = (event) => {
+    dataChannel = event.channel;
+    setupDataChannel(dataChannel);
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      push(ref(db, `rooms/${roomId}/guests/${guestId}/guestCandidates`), event.candidate.toJSON());
+    }
+  };
+
+  // 접속 노드 생성하여 선생님의 onChildAdded 트리거
+  await set(ref(db, `rooms/${roomId}/guests/${guestId}/joined`), true);
+
+  // 선생님의 Offer 수신 대기
+  onValue(ref(db, `rooms/${roomId}/guests/${guestId}/offer`), async (snapshot) => {
+    const offerData = snapshot.val();
+    if (offerData && offerData.sdp && pc.signalingState === "stable") {
+      await pc.setRemoteDescription(new RTCSessionDescription(offerData));
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      await set(ref(db, `rooms/${roomId}/guests/${guestId}/answer`), {
+        sdp: answer.sdp,
+        type: answer.type
+      });
+      appendMessage(null, "Answer 전송 완료, 연결 수립 중...", false, true);
+    }
+  });
+
+  // 선생님의 Candidates 수신
+  onChildAdded(ref(db, `rooms/${roomId}/guests/${guestId}/hostCandidates`), (snapshot) => {
+    const cand = snapshot.val();
+    if (cand) {
+      pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.error("Candidate 추가 에러:", e));
+    }
+  });
+});
+
+    function setupDataChannel(channel) {
+      channel.onopen = () => {
+        appendMessage(null, "채팅방에 연결되었습니다!", false, true);
+        document.getElementById('chatInput').disabled = false;
+        document.getElementById('btnSend').disabled = false;
+        document.getElementById('btnJoin').disabled = true;
+      };
+
+      // 선생님이나 다른 학생이 보낸 메시지(중계된 메시지) 수신
+      channel.onmessage = (e) => {
+        try {
+          const packet = JSON.parse(e.data); // { sender, text }
+          appendMessage(packet.sender, packet.text, false);
+        } catch (err) {
+          console.error("메시지 수신 오류:", err);
+        }
+      };
+    }
+
+    function sendMessage() {
+      const text = document.getElementById('chatInput').value.trim();
+      if (!text || !dataChannel || dataChannel.readyState !== 'open') return;
+
+      const packet = { sender: myName, text: text };
+
+      // 1. 내 화면에 메시지 표시
+      appendMessage(myName, text, true);
+
+      // 2. 선생님(Host)에게 발송 (선생님이 받아서 다른 학생들에게 중계)
+      dataChannel.send(JSON.stringify(packet));
+
+      document.getElementById('chatInput').value = '';
+    }
+
+    document.getElementById('btnSend').addEventListener('click', sendMessage);
+    document.getElementById('chatInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
+  </script>
+</body>
+</html>
